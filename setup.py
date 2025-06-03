@@ -6,8 +6,8 @@ with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
-    name="solstice-scrapegraph",
-    version="0.1.0",
+    name="scrapegraphai",
+    version="1.51.0",
     author="Solstice Team",
     author_email="contact@solstice.dev",
     description="A comprehensive web scraping and AI-powered data extraction library",
