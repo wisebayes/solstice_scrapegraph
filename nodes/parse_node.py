@@ -4,7 +4,8 @@ ParseNode Module
 
 import re
 from typing import List, Optional, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
+from bs4 import BeautifulSoup
 
 from langchain_community.document_transformers import Html2TextTransformer
 from langchain_core.documents import Document
@@ -83,14 +84,28 @@ class ParseNode(BaseNode):
         source = input_data[1] if self.parse_urls else None
 
         if self.parse_html:
-            docs_transformed = Html2TextTransformer(
-                ignore_links=False
-            ).transform_documents(input_data[0])
-            docs_transformed = docs_transformed[0]
+            # ----------------------------------------
+            # 1.  Run URL extraction on *raw HTML* to keep <img> tags intact.
+            #     html2text can strip/remove image elements, which prevents us
+            #     from ever seeing those URLs later.  Using the untouched HTML
+            #     guarantees every <img>/<a> reference is available.
+            # ----------------------------------------
+            raw_docs = input_data[0]
+            # Handle both single-Document and list-of-Document cases
+            if isinstance(raw_docs, list):
+                raw_html = "\n".join(doc.page_content for doc in raw_docs)
+            else:
+                raw_html = raw_docs.page_content
 
-            link_urls, img_urls = self._extract_urls(
-                docs_transformed.page_content, source
-            )
+            link_urls, img_urls = self._extract_urls(raw_html, source)
+
+            # ----------------------------------------
+            # 2.  Convert HTML → markdown/plain-text for chunking so that the
+            #     LLM gets cleaner text, *after* we've harvested URLs.
+            # ----------------------------------------
+            docs_transformed = Html2TextTransformer(ignore_links=False).transform_documents(raw_docs)
+            if isinstance(docs_transformed, list):
+                docs_transformed = docs_transformed[0]
 
             chunks = split_text_into_chunks(
                 text=docs_transformed.page_content,
@@ -130,52 +145,88 @@ class ParseNode(BaseNode):
         return state
 
     def _extract_urls(self, text: str, source: str) -> Tuple[List[str], List[str]]:
-        """
-        Extracts URLs from the given text.
+        """Return (links, images) detected in *text*.
 
-        Args:
-            text (str): The text to extract URLs from.
-
-        Returns:
-            Tuple[List[str], List[str]]: A tuple containing the extracted link URLs and image URLs.
+        The strategy is:
+        1.  Parse the string as HTML with BeautifulSoup – this reliably finds
+            <a>, <img>, <source>, etc. and their *href* / *src* / *data-src*.
+        2.  Run a regex pass to catch any http(s) links that are present in
+            markdown or plain text.
+        3.  Run a regex pass for the markdown relative-link syntax `](path)` so
+            we don't miss images that were converted to markdown by html2text.
+        4.  Normalise every URL – convert relative paths to absolute using the
+            original *source* page, strip whitespace, drop empty and hash-only
+            anchors, and split off query-strings when checking the extension.
         """
+
         if not self.parse_urls:
             return [], []
 
-        image_extensions = default_filters.filter_dict["img_exts"]
-        url = ""
-        all_urls = set()
+        image_exts = default_filters.filter_dict["img_exts"]
 
-        for group in ParseNode.url_pattern.findall(text):
-            for el in group:
-                if el != "":
-                    url += el
-            all_urls.add(url)
-            url = ""
+        links: set[str] = set()
+        images: set[str] = set()
 
-        url = ""
-        for group in ParseNode.relative_url_pattern.findall(text):
-            for el in group:
-                if el not in ["", "[", "]", "(", ")", "{", "}"]:
-                    url += el
-            all_urls.add(urljoin(source, url))
-            url = ""
+        def _categorise(url: str):
+            url = url.strip()
+            if not url or url in {"#", "/"}:
+                return
 
-        all_urls = list(all_urls)
-        all_urls = self._clean_urls(all_urls)
-        if not source.startswith("http"):
-            all_urls = [url for url in all_urls if url.startswith("http")]
-        else:
-            all_urls = [urljoin(source, url) for url in all_urls]
+            # Make absolute if needed
+            if not urlparse(url).scheme:
+                url_abs = urljoin(source, url)
+            else:
+                url_abs = url
 
-        images = [
-            url
-            for url in all_urls
-            if any(url.endswith(ext) for ext in image_extensions)
-        ]
-        links = [url for url in all_urls if url not in images]
+            # Decide image vs link
+            url_no_query = url_abs.split("?", 1)[0].split("#", 1)[0]
+            if any(url_no_query.lower().endswith(ext) for ext in image_exts):
+                images.add(url_abs)
+            else:
+                links.add(url_abs)
 
-        return links, images
+        # 1. BeautifulSoup on HTML content (may gracefully handle plain text)
+        try:
+            soup = BeautifulSoup(text, "html.parser")
+
+            # <a href>
+            for a in soup.find_all("a", href=True):
+                _categorise(a["href"])
+
+            # <img src> + common lazy-loading attributes
+            for tag in soup.find_all(["img", "source"]):
+                for attr in ("src", "data-src", "data-srcset", "srcset"):
+                    if tag.has_attr(attr):
+                        raw = tag[attr]
+                        # srcset can hold multiple URLs
+                        parts = [p.split()[0] for p in raw.split(",")] if attr.endswith("set") else [raw]
+                        for part in parts:
+                            _categorise(part)
+        except Exception as e:
+            if self.verbose:
+                self.logger.warning(f"BeautifulSoup parsing failed in _extract_urls: {e}")
+
+        # 2. Regex pass for absolute http(s) URLs in markdown/plain-text
+        abs_url_re = re.compile(r"https?://[^\s)\"'<>]+", re.I)
+        for match in abs_url_re.findall(text):
+            _categorise(match)
+
+        # 3. Regex pass for markdown relative links/images: ![alt](path) or [txt](path)
+        md_rel_re = re.compile(r"\]\(([^)]+)\)")
+        for match in md_rel_re.findall(text):
+            # Ignore titles inside the same parens – take only the first token
+            _categorise(match.split()[0])
+
+        # Remove duplicates and ensure deterministic order for reproducibility
+        final_links = sorted(links - images)
+        final_images = sorted(images)
+
+        if self.verbose:
+            self.logger.info(
+                f"Extracted {len(final_links)} links and {len(final_images)} images from page"
+            )
+
+        return final_links, final_images
 
     def _clean_urls(self, urls: List[str]) -> List[str]:
         """

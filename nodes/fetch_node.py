@@ -372,7 +372,8 @@ class FetchNode(BaseNode):
                 # parsed_content = "\n########\n".join(parsed_content)
                 parsed_content = convert_to_md(parsed_content)
                 # print("####")
-                # print(parsed_content)
+                # with open("voquezna_gerd_md.md", "w") as f:
+                #     f.write(parsed_content)
                 # print("####")
 
             compressed_document = [
